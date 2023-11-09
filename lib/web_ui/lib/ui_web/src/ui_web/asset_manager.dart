@@ -7,6 +7,20 @@ import 'dart:typed_data';
 
 import 'package:ui/src/engine.dart';
 
+const String ahemFontFamily = 'Ahem';
+const String ahemFontUrl = '/assets/fonts/ahem.ttf';
+const String robotoFontFamily = 'Roboto';
+const String robotoTestFontUrl = '/assets/fonts/Roboto-Regular.ttf';
+
+/// The list of test fonts, in the form of font family name - font file url pairs.
+/// This list does not include embedded test fonts, which need to be loaded and
+/// registered separately in [FontCollection.debugDownloadTestFonts].
+const Map<String, String> testFontUrls = <String, String>{
+  ahemFontFamily: ahemFontUrl,
+  robotoFontFamily: robotoTestFontUrl,
+  'RobotoVariable': '/assets/fonts/RobotoSlab-VariableFont_wght.ttf',
+};
+
 /// Provides the [AssetManager] used by the Flutter Engine.
 AssetManager get assetManager => engineAssetManager;
 
@@ -81,20 +95,113 @@ class AssetManager {
   }
 
   /// Loads an asset and returns the server response.
-  Future<Object> loadAsset(String asset) {
-    return httpFetch(getAssetUrl(asset));
+  Future<HttpFetchResponse> loadAsset(String asset) async {
+    final ByteData result = await load(asset);
+
+    return HttpFetchResponseImpl.fromByteData(result, asset);
   }
 
-  /// Loads an asset using an [XMLHttpRequest] and returns data as [ByteData].
+  /// Loads an asset using an [DomXMLHttpRequest] and returns data as [ByteData].
   Future<ByteData> load(String asset) async {
     final String url = getAssetUrl(asset);
-    final HttpFetchResponse response = await httpFetch(url);
+    try {
+      final DomXMLHttpRequest request = await domHttpRequest(url, responseType: 'arraybuffer');
 
-    if (response.status == 404 && asset == 'AssetManifest.json') {
-      printWarning('Asset manifest does not exist at `$url` - ignoring.');
-      return Uint8List.fromList(utf8.encode('{}')).buffer.asByteData();
+      final ByteBuffer response = request.response as ByteBuffer;
+      return response.asByteData();
+    } catch (e) {
+      if (!domInstanceOfString(e, 'ProgressEvent')) {
+        rethrow;
+      }
+      final DomProgressEvent p = e as DomProgressEvent;
+      final DomEventTarget? target = p.target;
+      if (domInstanceOfString(target, 'XMLHttpRequest')) {
+        final DomXMLHttpRequest request = target! as DomXMLHttpRequest;
+        if (request.status == 404 && asset == 'AssetManifest.json') {
+          printWarning('Asset manifest does not exist at `$url` – ignoring.');
+          return Uint8List.fromList(utf8.encode('{}')).buffer.asByteData();
+        }
+        rethrow;
+      }
+
+      final String? constructorName = target == null ? 'null' : domGetConstructorName(target);
+      printWarning('Caught ProgressEvent with unknown target: '
+          '$constructorName');
+      rethrow;
+    }
+  }
+}
+
+/// An asset manager that gives fake empty responses for assets.
+class WebOnlyMockAssetManager extends AssetManager {
+  /// Mock asset directory relative to base url.
+  String defaultAssetsDir = '';
+
+  /// Mock empty asset manifest.
+  String defaultAssetManifest = '{}';
+
+  /// Mock font manifest overridable for unit testing.
+  String defaultFontManifest = '''
+  [
+   {
+      "family":"$robotoFontFamily",
+      "fonts":[{"asset":"$robotoTestFontUrl"}]
+   },
+   {
+      "family":"$ahemFontFamily",
+      "fonts":[{"asset":"$ahemFontUrl"}]
+   }
+  ]''';
+
+  @override
+  String get assetsDir => defaultAssetsDir;
+
+  @override
+  String getAssetUrl(String asset) => asset;
+
+  @override
+  Future<HttpFetchResponse> loadAsset(String asset) async {
+    if (asset == getAssetUrl('AssetManifest.json')) {
+      return MockHttpFetchResponse(
+        url: asset,
+        status: 200,
+        payload: MockHttpFetchPayload(
+          byteBuffer: _toByteData(utf8.encode(defaultAssetManifest)).buffer,
+        ),
+      );
+    }
+    if (asset == getAssetUrl('FontManifest.json')) {
+      return MockHttpFetchResponse(
+        url: asset,
+        status: 200,
+        payload: MockHttpFetchPayload(
+          byteBuffer: _toByteData(utf8.encode(defaultFontManifest)).buffer,
+        ),
+      );
     }
 
-    return (await response.payload.asByteBuffer()).asByteData();
+    return MockHttpFetchResponse(
+      url: asset,
+      status: 404,
+    );
+  }
+
+  @override
+  Future<ByteData> load(String asset) {
+    if (asset == getAssetUrl('AssetManifest.json')) {
+      return Future<ByteData>.value(_toByteData(utf8.encode(defaultAssetManifest)));
+    }
+    if (asset == getAssetUrl('FontManifest.json')) {
+      return Future<ByteData>.value(_toByteData(utf8.encode(defaultFontManifest)));
+    }
+    throw HttpFetchNoPayloadError(asset, status: 404);
+  }
+
+  ByteData _toByteData(List<int> bytes) {
+    final ByteData byteData = ByteData(bytes.length);
+    for (int i = 0; i < bytes.length; i++) {
+      byteData.setUint8(i, bytes[i]);
+    }
+    return byteData;
   }
 }

@@ -3,10 +3,12 @@
 // found in the LICENSE file.
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:js_interop';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:js/js.dart';
 import 'package:js/js_util.dart' as js_util;
 import 'package:meta/meta.dart';
 
@@ -367,10 +369,7 @@ extension DomEventTargetExtension on DomEventTarget {
 }
 
 typedef DartDomEventListener = JSVoid Function(DomEvent event);
-
-@JS()
-@staticInterop
-class DomEventListener {}
+typedef DomEventListener = void Function(DomEvent event);
 
 DomEventListener createDomEventListener(DartDomEventListener listener) =>
     listener.toJS as DomEventListener;
@@ -1420,6 +1419,74 @@ extension DomCanvasGradientExtension on DomCanvasGradient {
       _addColorStop(offset.toJS, color.toJS);
 }
 
+
+String? domGetConstructorName(Object o) {
+  final Object? constructor = js_util.getProperty(o, 'constructor');
+  if (constructor == null) {
+    return '';
+  }
+  return js_util.getProperty(constructor, 'name')?.toString();
+}
+
+Object? domGetConstructor(String constructorName) =>
+    js_util.getProperty(domWindow, constructorName);
+
+
+@JS()
+@staticInterop
+class DomXMLHttpRequest extends DomXMLHttpRequestEventTarget {}
+
+Object? domCallConstructorString(String constructorName, List<Object?> args) {
+  final Object? constructor = domGetConstructor(constructorName);
+  if (constructor == null) {
+    return null;
+  }
+  return js_util.callConstructor(constructor, args);
+}
+
+DomXMLHttpRequest createDomXMLHttpRequest() =>
+    domCallConstructorString('XMLHttpRequest', <Object?>[])!
+    as DomXMLHttpRequest;
+
+Future<DomXMLHttpRequest> domHttpRequest(String url,
+    {String? responseType, String method = 'GET', dynamic sendData}) {
+  final Completer<DomXMLHttpRequest> completer = Completer<DomXMLHttpRequest>();
+  final DomXMLHttpRequest xhr = createDomXMLHttpRequest();
+  xhr.open(method, url, /* async */ true);
+  if (responseType != null) {
+    xhr.responseType = responseType;
+  }
+
+  xhr.addEventListener('load', allowInterop((DomEvent e) {
+    final int status = xhr.status!;
+    final bool accepted = status >= 200 && status < 300;
+    final bool fileUri = status == 0;
+    final bool notModified = status == 304;
+    final bool unknownRedirect = status > 307 && status < 400;
+    if (accepted || fileUri || notModified || unknownRedirect) {
+      completer.complete(xhr);
+    } else {
+      completer.completeError(e);
+    }
+  }));
+
+  xhr.addEventListener('error', allowInterop(completer.completeError));
+  xhr.send(sendData);
+  return completer.future;
+}
+
+extension DomXMLHttpRequestExtension on DomXMLHttpRequest {
+  external dynamic get response;
+  external String? get responseText;
+  external String get responseType;
+  external int? get status;
+  external set responseType(String value);
+  void open(String method, String url, [bool? async]) => js_util.callMethod(
+      this, 'open', <Object>[method, url, if (async != null) async]);
+  void send([Object? bodyOrData]) => js_util
+      .callMethod(this, 'send', <Object>[if (bodyOrData != null) bodyOrData]);
+}
+
 @JS()
 @staticInterop
 class DomXMLHttpRequestEventTarget extends DomEventTarget {}
@@ -1453,10 +1520,36 @@ Future<HttpFetchResponse> httpFetch(String url) async {
     }
   }
   try {
-    final DomResponse domResponse = await rawHttpGet(url);
-    return HttpFetchResponseImpl._(url, domResponse);
+    final ByteData result = await load(url);
+    return HttpFetchResponseImpl.fromByteData(result, url);
   } catch (requestError) {
     throw HttpFetchError(url, requestError: requestError);
+  }
+}
+
+Future<ByteData> load(String asset) async {
+  final String url = asset;
+  try {
+    final DomXMLHttpRequest request =
+    await domHttpRequest(url, responseType: 'arraybuffer');
+
+    final ByteBuffer response = request.response as ByteBuffer;
+    return response.asByteData();
+  } catch (e) {
+    if (!domInstanceOfString(e, 'ProgressEvent')) {
+      rethrow;
+    }
+    final DomProgressEvent p = e as DomProgressEvent;
+    final DomEventTarget? target = p.target;
+    if (domInstanceOfString(target, 'XMLHttpRequest')) {
+      final DomXMLHttpRequest request = target! as DomXMLHttpRequest;
+      if (request.status == 404 && asset == 'AssetManifest.json') {
+        return Uint8List.fromList(utf8.encode('{}')).buffer.asByteData();
+      }
+      rethrow;
+    }
+
+    rethrow;
   }
 }
 
@@ -1478,12 +1571,7 @@ Future<DomResponse> _rawHttpPost(String url, String data) =>
 /// is meant for tests only.
 @visibleForTesting
 Future<HttpFetchResponse> testOnlyHttpPost(String url, String data) async {
-  try {
-    final DomResponse domResponse = await _rawHttpPost(url, data);
-    return HttpFetchResponseImpl._(url, domResponse);
-  } catch (requestError) {
-    throw HttpFetchError(url, requestError: requestError);
-  }
+  throw 'Not implemented';
 }
 
 /// Convenience function for making a fetch request and getting the data as a
@@ -1557,7 +1645,7 @@ extension HttpFetchResponseExtension on HttpFetchResponse {
 
   /// Returns the data parsed as JSON.
   Future<dynamic> json() {
-    return payload.json();
+    return payload.toJson();
   }
 
   /// Return the data as a string.
@@ -1567,41 +1655,38 @@ extension HttpFetchResponseExtension on HttpFetchResponse {
 }
 
 class HttpFetchResponseImpl implements HttpFetchResponse {
-  HttpFetchResponseImpl._(this.url, this._domResponse);
-
-  @override
-  final String url;
-
-  final DomResponse _domResponse;
-
-  @override
-  int get status => _domResponse.status;
-
-  @override
-  int? get contentLength {
-    final String? header = _domResponse.headers.get('Content-Length');
-    if (header == null) {
-      return null;
-    }
-    return int.tryParse(header);
+  factory HttpFetchResponseImpl.fromByteData(ByteData byteData, String url) {
+    return HttpFetchResponseImpl._(
+      byteData.lengthInBytes,
+      byteData.lengthInBytes > 0,
+      HttpFetchPayloadImpl(byteData),
+      0,
+      url,
+    );
   }
 
-  @override
-  bool get hasPayload {
-    final bool accepted = status >= 200 && status < 300;
-    final bool fileUri = status == 0;
-    final bool notModified = status == 304;
-    final bool unknownRedirect = status > 307 && status < 400;
-    return accepted || fileUri || notModified || unknownRedirect;
-  }
+  HttpFetchResponseImpl._(
+      this.contentLength,
+      this.hasPayload,
+      this.payload,
+      this.status,
+      this.url,
+      );
 
   @override
-  HttpFetchPayload get payload {
-    if (!hasPayload) {
-      throw HttpFetchNoPayloadError(url, status: status);
-    }
-    return HttpFetchPayloadImpl._(_domResponse);
-  }
+  int? contentLength;
+
+  @override
+  bool hasPayload;
+
+  @override
+  HttpFetchPayload payload;
+
+  @override
+  int status;
+
+  @override
+  String url;
 }
 
 /// A fake implementation of [HttpFetchResponse] for testing.
@@ -1645,44 +1730,42 @@ abstract class HttpFetchPayload {
   Future<ByteBuffer> asByteBuffer();
 
   /// Returns the data parsed as JSON.
-  Future<dynamic> json();
+  Future<dynamic> toJson();
 
   /// Return the data as a string.
   Future<String> text();
 }
 
-class HttpFetchPayloadImpl implements HttpFetchPayload {
-  HttpFetchPayloadImpl._(this._domResponse);
+class HttpFetchPayloadImpl extends HttpFetchPayload {
+  HttpFetchPayloadImpl(
+    this.byteData, [
+    this._domResponse,
+  ]);
 
-  final DomResponse _domResponse;
+  final DomResponse? _domResponse;
+  final ByteData byteData;
 
   @override
-  Future<void> read<T>(HttpFetchReader<T> callback) async {
-    final _DomReadableStream stream = _domResponse.body;
-    final _DomStreamReader reader = stream.getReader();
-
-    while (true) {
-      final _DomStreamChunk chunk = await reader.read();
-      if (chunk.done) {
-        break;
-      }
-      callback(chunk.value as T);
-    }
+  Future<dynamic> toJson() {
+    return Future<dynamic>.value(json.decode(utf8.decode(byteData.buffer.asUint8List())));
   }
 
   /// Returns the data as a [ByteBuffer].
   @override
   Future<ByteBuffer> asByteBuffer() async {
-    return (await _domResponse.arrayBuffer())! as ByteBuffer;
+    return byteData.buffer;
   }
 
-  /// Returns the data parsed as JSON.
   @override
-  Future<dynamic> json() => _domResponse.json();
+  Future<void> read<T>(HttpFetchReader<T> reader) async {
+    reader(Uint8List.fromList((await asByteBuffer()).asUint8List()) as T);
+  }
 
   /// Return the data as a string.
   @override
-  Future<String> text() => _domResponse.text();
+  Future<String> text() {
+    return Future<String>.value(String.fromCharCodes(byteData.buffer.asUint8List()));
+  }
 }
 
 typedef MockOnRead = Future<void> Function<T>(HttpFetchReader<T> callback);
@@ -1715,7 +1798,7 @@ class MockHttpFetchPayload implements HttpFetchPayload {
   Future<ByteBuffer> asByteBuffer() async => _byteBuffer;
 
   @override
-  Future<dynamic> json() async => throw AssertionError('json not supported by mock');
+  Future<dynamic> toJson() async => null;
 
   @override
   Future<String> text() async => throw AssertionError('text not supported by mock');
